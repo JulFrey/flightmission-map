@@ -1,0 +1,197 @@
+# Script to aquire and analyze data from ODK-Aggregate server via REST-API 
+# https://docs.opendatakit.org/briefcase-api/
+# by Julian Frey
+# 2019-09-08
+
+
+##----------
+## Packages
+##----------
+
+# first instal lib-ssl sudo apt-get install libssl-dev
+#install.packages("httr", "XML", "sp", "leaflet","jsonlite","stringr", "shiny")
+
+#Require the packages
+require("httr")
+require("XML")
+#require("sp")
+require("leaflet")
+require("jsonlite")
+require("stringr")
+require("shiny")
+
+##------------
+## configuration
+##------------
+options(stringsAsFactors = F)
+base <- 'http://confobi-db.vm.uni-freiburg.de/ODKAggregate/view/'
+formID <- 'build_Flugbuch-neu_1566312771'
+
+##------------
+## get uuid's of forms
+##------------
+
+# get uuid of forms 
+forms <- GET(paste0(base,'submissionList','?','formId=', formID))
+forms <- simplify2array(xmlToList(xmlParse(forms))['idList']$id)
+
+##------------
+## get entries via API request
+##------------
+
+#testcall
+test_url <- paste0(
+  base,
+  'downloadSubmission?formId=',
+  formID,
+  URLencode(paste0('[@version=null+and+@uiVersion=null]/data[@key=',forms[1],']'), reserved = T))
+
+entry.call <- function(uuid){
+  paste0(
+    base,
+    'downloadSubmission?formId=',
+    formID,
+    URLencode(paste0('[@version=null+and+@uiVersion=null]/data[@key=',uuid,']'), reserved = T))
+}
+
+test_call <- GET(test_url)
+
+if(test_call[[2]] != 200) {
+  print('API request failed')
+}
+rm(test_call)
+
+get.entries <- function(){
+  
+  # generate df for results
+  entry <- simplify2array(xmlToList(xmlParse(GET(test_url)))$data$data)[1:11]
+  entries <- t(data.frame(row.names= names(entry)))
+  
+  # get ODK aggregate entries 
+  for(f in forms){
+    entry <- unlist(as.character(simplify2array(xmlToList(xmlParse(GET(entry.call(f))))$data$data)[1:11]))
+    entries <- rbind(entries,entry)
+  }
+  
+  # convert dates
+  entries <- data.frame(entries)
+  entries$date_time <- as.POSIXct(strptime(paste0(entries$date_time,''),format = '%Y-%m-%dT%H:%M:%S.000' ))
+  entries$end_time <- as.POSIXct(strptime(paste0(entries$end_time,''),format = '%Y-%m-%dT%H:%M:%S.000' ))
+  
+  # convert location
+  locations <- t(data.frame(strsplit(as.character(entries$location),' ')))
+  colnames(locations) <- c('lat','lon','alt','acc')
+  row.names(locations) = row.names(entries)
+  locations <- apply(locations,2,as.numeric)
+  entries <- cbind(entries, locations)
+  
+  entries <- entries[!is.na(entries$lat),]
+  return(entries)
+}
+
+entries <- suppressWarnings(get.entries())
+
+# save time to update entries if timedifference bigger 5 min
+t1 <- Sys.time()
+
+
+##-------------
+## load additional map data
+##-------------
+plots_json_url <- 'http://umap.openstreetmap.fr/en/datalayer/644789/'
+plots <- jsonlite::fromJSON('http://umap.openstreetmap.fr/en/datalayer/644789/')
+plots_df <- cbind(plots$features$properties, t(simplify2array(plots$features$geometry$coordinates)))
+names(plots_df) <- c('name', 'cmt', 'desc', 'lon', 'lat')
+
+plots_df$compl <- plots_df$name %in% paste0('CFB',str_pad(entries$CFB_plot,3,'left','0'))
+
+flightlog <- read.csv('2018-07-12_Flugbuch_final.csv')
+flightlog$name <- paste0('CFB',str_pad(flightlog$CFB_plot,3,'left','0'))
+flightlog$date_time <- as.POSIXct(strptime(paste0(flightlog$date_time,''),format = '%Y-%m-%d %H:%M:%S.0' ))
+names(flightlog) <- c("meta.instanceID","first_date","st_lat","st_lon", "st_alt", "st_acc","pilot","starts","remarks","CFB_plot","end_time","name") 
+
+plots_df <- merge(plots_df,flightlog, all = T)
+plots_df <- plots_df[order(plots_df$first_date,decreasing = T),]
+plots_df <- plots_df[!duplicated(plots_df$name) & !is.na(plots_df$cmt),]
+
+
+##------------
+## shiny app
+##------------
+
+
+ui <- bootstrapPage(
+  tags$style(type = "text/css", "html, body {width:100%;height:100%}"),
+  leafletOutput("map", height = "100%", width = '100%'),
+  absolutePanel(top = 100, left = 30,style = 'background-color:#ffffff90;' , 
+  numericInput('ps','Filter Plot',value = 0, width = 100, max = 999),
+  sliderInput("range", "Flight date", min(plots_df$first_date), max(plots_df$first_date),
+              value = range(plots_df$first_date), step = 24*60^2, timeFormat = '%Y-%m-%d'
+  ),
+  img(src='https://envisiontec.com/wp-content/uploads/2016/11/Logo_Uni_Freiburg-150x150.png', width = '200px' )
+  )
+)
+
+server <- function(input, output, session) {
+  plot.name <- function(id)paste0('CFB',str_pad(id,3,'left','0'))
+  
+  filteredData <- reactive({
+    # get slider values
+    #min <- min(plots_df$first_date, na.rm = T)
+    #max <- max(plots_df$first_date, na.rm = T)
+    #plots_df$color <- rgb(0.5,0.5,0.5,1) #grey
+    #plots_df$color[!plots_df$compl &plots_df$first_date >= min & plots_df$first_date <= max] <- rgb(1,0,0,1) # red
+    #plots_df$color[plots_df$compl & plots_df$first_date >= min & plots_df$first_date <= max] <- rgb(0,1,0,1)
+    plots_df[ifelse(plot.name(input$ps) %in% plots_df$name , which(plot.name(input$ps) == plots_df$name),T),]
+
+    #plots_df
+  })
+  
+  colors <- reactive({
+    # download up to date data if not done 5 mins ago
+    if(difftime(Sys.time(), t1, units = 'mins') > 5){
+      t1 <<- Sys.time()
+      print('get API entries')
+      entries <<- suppressWarnings(get.entries())
+      # mark plots flown in 2019
+    }
+    
+    # merge plots with entries
+    et <- entries
+    et$name <- plot.name(et$CFB_plot)
+    #plots <- merge(plots_df, et, by = 'name', all.x = T)
+    #plots <- plots[!duplicated(plots$name),]
+    plots <- plots_df
+    plots$compl <- plots$name %in% et$name
+    
+    # get slider values
+    min <- input$range[1]
+    max <- input$range[2]
+    
+    # assign colors
+    plots$color <- rgb(0.5,0.5,0.5,1) #grey
+    plots$color[!plots$compl &plots$first_date >= min & plots$first_date <= max] <- rgb(1,0,0,1) # red
+    plots$color[plots$compl & plots$first_date >= min & plots$first_date <= max] <- rgb(0,1,0,1) #green  
+    
+    #return
+    plots$color
+  })
+  
+  output$map <- renderLeaflet({
+    leaflet(entries) %>% 
+      addTiles() %>% 
+      addProviderTiles('OpenTopoMap') %>%
+      addCircleMarkers(lng = ~lon, lat = ~lat, label = ~date_time, labelOptions = labelOptions(permanent=F, textOnly = T, direction = 'center'), color = 'black', radius = 1, opacity = 1)
+    })
+  
+  
+   observe({
+     #clearShapes() %>%
+     leafletProxy("map", data = filteredData()) %>% clearMarkers() %>%
+       addCircleMarkers(lng = ~lon, lat = ~lat, label = ~name, labelOptions = labelOptions(permanent=T, textOnly = T, direction = 'center'), popup = ~first_date ,data = filteredData(), color = colors(), opacity = 1)
+
+ })
+}
+
+shinyApp(ui, server)
+
